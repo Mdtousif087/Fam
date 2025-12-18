@@ -3,87 +3,46 @@ import requests
 import threading
 import time
 import os
-import json
 
 app = Flask(__name__)
 
 # ====================================
-# ENVIRONMENT VARIABLES (Vercel pe set karna)
+# ENVIRONMENT VARIABLES
 # ====================================
 AUTH_TOKEN = os.environ.get('AUTH_TOKEN')
 DEVICE_ID = os.environ.get('DEVICE_ID')
 USER_AGENT = os.environ.get('USER_AGENT')
 API_HOST = os.environ.get('API_HOST', 'https://westeros.famapp.in')
 
-# Cache file
-CACHE_FILE = "cache.json"
-
 # ====================================
-# VALIDATE ENVIRONMENT
+# IN-MEMORY CACHE (No file needed)
 # ====================================
-def check_env():
-    """Check if required environment variables are set"""
-    missing = []
-    if not AUTH_TOKEN:
-        missing.append('AUTH_TOKEN')
-    if not DEVICE_ID:
-        missing.append('DEVICE_ID')
-    if not USER_AGENT:
-        missing.append('USER_AGENT')
-    
-    return missing
-
-# ====================================
-# CACHE SYSTEM
-# ====================================
-def load_cache():
-    try:
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, 'r') as f:
-                cache = json.load(f)
-                
-                # Clean old entries (24 hours)
-                current = time.time()
-                cleaned = {}
-                for key, val in cache.items():
-                    if current - val.get('time', 0) < 86400:
-                        cleaned[key] = val
-                
-                if len(cleaned) != len(cache):
-                    save_cache(cleaned)
-                
-                return cleaned
-    except:
-        return {}
-    return {}
-
-def save_cache(cache):
-    try:
-        with open(CACHE_FILE, 'w') as f:
-            json.dump(cache, f, indent=2)
-    except:
-        pass
+cache = {}
+CACHE_EXPIRY = 86400  # 24 hours
 
 def get_cached(fam_id):
-    cache = load_cache()
+    """Get from memory cache"""
     if fam_id in cache:
-        data = cache[fam_id]
-        if time.time() - data['time'] < 86400:
-            return data
+        entry = cache[fam_id]
+        if time.time() - entry['time'] < CACHE_EXPIRY:
+            return entry
         else:
             del cache[fam_id]
-            save_cache(cache)
     return None
 
 def add_cache(fam_id, phone, name):
-    cache = load_cache()
-    cache[fam_id] = {'phone': phone, 'name': name, 'time': time.time()}
+    """Add to memory cache"""
+    cache[fam_id] = {
+        'phone': phone,
+        'name': name,
+        'time': time.time()
+    }
     
-    # Keep only 500 entries max
-    if len(cache) > 500:
-        cache = dict(list(cache.items())[-500:])
-    
-    save_cache(cache)
+    # Keep only 100 entries max
+    if len(cache) > 100:
+        # Remove oldest entry
+        oldest_key = min(cache.keys(), key=lambda k: cache[k]['time'])
+        del cache[oldest_key]
 
 # ====================================
 # API FUNCTIONS
@@ -120,30 +79,29 @@ def unblock_bg(session, fam_id):
 # ====================================
 @app.route('/')
 def home():
-    missing = check_env()
+    missing = []
+    if not AUTH_TOKEN: missing.append('AUTH_TOKEN')
+    if not DEVICE_ID: missing.append('DEVICE_ID')
+    if not USER_AGENT: missing.append('USER_AGENT')
     
     if missing:
         return jsonify({
-            "error": f"Missing environment variables: {', '.join(missing)}",
-            "instructions": "Set AUTH_TOKEN, DEVICE_ID, USER_AGENT on Vercel"
+            "error": f"Missing: {', '.join(missing)}"
         }), 500
     
-    cache = load_cache()
     return jsonify({
         "app": "FamPay Lookup",
         "status": "active",
         "cache_entries": len(cache),
+        "cache_type": "in-memory",
         "usage": "/get?id=username@fam"
     })
 
 @app.route('/get')
 def get_number():
-    # Check env first
-    missing = check_env()
-    if missing:
-        return jsonify({
-            "error": f"Server not configured. Missing: {', '.join(missing)}"
-        }), 500
+    # Check env
+    if not AUTH_TOKEN or not DEVICE_ID or not USER_AGENT:
+        return jsonify({"error": "Server not configured"}), 500
     
     fam_id = request.args.get('id', '').strip()
     
@@ -161,7 +119,8 @@ def get_number():
             "fam_id": fam_id,
             "name": cached['name'],
             "phone": cached['phone'],
-            "cached": True
+            "cached": True,
+            "cache_entries": len(cache)
         })
     
     try:
@@ -220,29 +179,50 @@ def get_number():
 
 @app.route('/cache')
 def cache_info():
-    cache = load_cache()
+    """Show cache contents"""
+    entries = []
+    current_time = time.time()
+    
+    for fam_id, data in cache.items():
+        age = current_time - data['time']
+        expires_in = CACHE_EXPIRY - age
+        
+        entries.append({
+            "fam_id": fam_id,
+            "name": data['name'],
+            "phone": "****" + data['phone'][-4:] if data['phone'] else "",
+            "age_hours": round(age/3600, 1),
+            "expires_in_hours": round(max(0, expires_in/3600), 1)
+        })
+    
+    # Sort by newest
+    entries.sort(key=lambda x: x['age_hours'])
+    
     return jsonify({
-        "entries": len(cache),
-        "keys": list(cache.keys())[:20]
+        "total": len(entries),
+        "cache_type": "in-memory",
+        "max_age_hours": 24,
+        "entries": entries[:20]  # Show first 20
     })
 
 @app.route('/clear', methods=['POST'])
 def clear_cache():
-    try:
-        if os.path.exists(CACHE_FILE):
-            os.remove(CACHE_FILE)
-        return jsonify({"success": True})
-    except:
-        return jsonify({"success": False}), 500
+    """Clear memory cache"""
+    global cache
+    cache.clear()
+    return jsonify({
+        "success": True,
+        "message": "Cache cleared",
+        "entries_cleared": len(cache)
+    })
 
 @app.route('/env')
 def env_check():
-    """Debug endpoint to check environment (remove in production)"""
     return jsonify({
         "AUTH_TOKEN_set": bool(AUTH_TOKEN),
         "DEVICE_ID_set": bool(DEVICE_ID),
         "USER_AGENT_set": bool(USER_AGENT),
-        "API_HOST": API_HOST
+        "cache_size": len(cache)
     })
 
 # ====================================
